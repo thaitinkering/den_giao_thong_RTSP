@@ -1,0 +1,138 @@
+# gui/roi_overlay.py
+from PySide6.QtWidgets import QLabel, QInputDialog, QMenu
+from PySide6.QtCore    import Qt, QPoint
+from PySide6.QtGui     import QPainter, QPen, QPolygon, QColor
+
+
+class RoiOverlay(QLabel):
+    """Lưu ROI ở toạ độ ẢNH GỐC; chuyển đổi sang toạ độ LABEL khi hiển thị."""
+    CLOSE_DIST = 10  # px – click gần đỉnh đầu để đóng polygon
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # ROI đã khoá: [{"name": str, "points": [QPoint in IMAGE space]}]
+        self.rois = []
+
+        # Đa giác đang vẽ (điểm theo LABEL space trong lúc preview)
+        self.current_poly = []      # list[QPoint label-space]
+        self.drawing_poly = False
+
+        # Biến chuyển đổi ảnh<->label (cập nhật mỗi khung)
+        self.scale = 1.0
+        self.off_x = 0
+        self.off_y = 0
+        self.src_w = 0
+        self.src_h = 0
+
+    # ---------- Nhận thông tin chuyển đổi từ MainWindow ----------
+    def set_view_transform(self, scale: float, off_x: int, off_y: int, src_w: int, src_h: int):
+        self.scale, self.off_x, self.off_y = scale, off_x, off_y
+        self.src_w, self.src_h = src_w, src_h
+        self.update()
+
+    # ---------- Chuyển đổi toạ độ ----------
+    def label_to_image_pt(self, p: QPoint) -> QPoint:
+        x = (p.x() - self.off_x) / self.scale
+        y = (p.y() - self.off_y) / self.scale
+        xi = max(0, min(int(round(x)), max(0, self.src_w - 1)))
+        yi = max(0, min(int(round(y)), max(0, self.src_h - 1)))
+        return QPoint(xi, yi)
+
+    def image_to_label_pt(self, p: QPoint) -> QPoint:
+        x = int(round(p.x() * self.scale + self.off_x))
+        y = int(round(p.y() * self.scale + self.off_y))
+        return QPoint(x, y)
+
+    # ---------- API từ MainWindow ----------
+    def start_polygon_mode(self):
+        self.current_poly.clear()
+        self.drawing_poly = True
+        self.update()
+
+    # ---------- Chuột trái: vẽ đa giác ----------
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self.drawing_poly:
+            pos = e.pos()
+            if (len(self.current_poly) >= 3 and
+                (pos - self.current_poly[0]).manhattanLength() < self.CLOSE_DIST):
+                self._finish_polygon()
+                return
+            self.current_poly.append(pos)
+            self.update()
+
+    def mouseDoubleClickEvent(self, e):
+        if self.drawing_poly and len(self.current_poly) >= 3:
+            self._finish_polygon()
+
+    # ---------- Chuột phải: menu Rename/Delete ----------
+    def contextMenuEvent(self, ev):
+        pos = ev.pos()
+        idx = self._roi_index_at_label_pos(pos)
+        if idx is None:
+            return
+        menu = QMenu(self)
+        act_rename = menu.addAction("Rename…")
+        act_delete = menu.addAction("Delete")
+        chosen = menu.exec(ev.globalPos())
+        if chosen == act_rename:
+            self._rename_roi(idx)
+        elif chosen == act_delete:
+            self._delete_roi(idx)
+
+    # --- Helpers: tìm ROI chứa điểm label-space ---
+    def _roi_index_at_label_pos(self, pos) -> int | None:
+        for i, roi in enumerate(self.rois):
+            lbl_pts = [self.image_to_label_pt(p) for p in roi["points"]]
+            if QPolygon(lbl_pts).containsPoint(pos, Qt.OddEvenFill):
+                return i
+        return None
+
+    def _rename_roi(self, idx):
+        name_old = self.rois[idx]["name"]
+        name_new, ok = QInputDialog.getText(self, "Rename ROI", "New label:", text=name_old)
+        if ok and name_new and name_new != name_old:
+            self.rois[idx]["name"] = name_new
+            self.parent().roi_manager[idx]["name"] = name_new
+            self.update()
+
+    def _delete_roi(self, idx):
+        del self.rois[idx]
+        del self.parent().roi_manager[idx]
+        self.parent().save_config()   # tuỳ bạn giữ/dỡ dòng này
+        self.update()
+
+    # --- Kết thúc polygon: convert LABEL -> IMAGE & lưu ---
+    def _finish_polygon(self):
+        name, ok = QInputDialog.getText(self, "ROI Name", "Label:")
+        if ok and name:
+            img_pts = [self.label_to_image_pt(p) for p in self.current_poly]
+            roi = {"name": name, "points": img_pts}      # IMAGE space
+            self.rois.append(roi)
+            self.parent().roi_manager.append(roi)        # IMAGE space để lưu/engine
+            # self.parent().save_config()  # nếu muốn auto-save
+        self.current_poly.clear()
+        self.drawing_poly = False
+        self.update()
+
+    # ---------- Vẽ ----------
+    def paintEvent(self, ev):
+        super().paintEvent(ev)
+        painter = QPainter(self)
+
+        # ROI đã khoá (image->label để vẽ)
+        painter.setPen(QPen(Qt.green, 2, Qt.DashLine))
+        painter.setBrush(QColor(0, 255, 0, 40))
+        for roi in self.rois:
+            lbl_pts = [self.image_to_label_pt(p) for p in roi["points"]]
+            poly    = QPolygon(lbl_pts)
+            painter.drawPolygon(poly)
+            painter.drawText(poly.boundingRect().center(), roi["name"])
+
+        # Preview đa giác đang vẽ (label-space)
+        if self.current_poly:
+            painter.setPen(QPen(Qt.yellow, 2, Qt.DotLine))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPolyline(QPolygon(self.current_poly))
+            painter.setPen(Qt.yellow)
+            for p in self.current_poly:
+                painter.drawEllipse(p, 3, 3)
