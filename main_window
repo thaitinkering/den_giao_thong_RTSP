@@ -1,0 +1,176 @@
+import os, time, yaml, torch
+from PySide6.QtWidgets import (
+    QMainWindow, QToolBar, QInputDialog, QLabel, QMessageBox
+)
+from PySide6.QtGui import QAction, QPixmap, QImage, QPainter
+from PySide6.QtCore import Qt, QPoint
+
+from gui.roi_overlay import RoiOverlay
+from core.traffic_engine import TrafficEngine
+
+CFG_PATH   = "config.yaml"
+MODEL_PATH = r"models\yolov8s-visdrone\best.pt"
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Traffic Monitor")
+        self.resize(960, 540)
+
+        # ----- Video + ROI Overlay -----
+        self.video_lbl = RoiOverlay(self)
+        self.setCentralWidget(self.video_lbl)
+        self.roi_manager: list[dict] = []
+
+        # ----- Toolbar -----
+        tb = QToolBar("Main")
+        self.addToolBar(tb)
+
+        act_open     = QAction("Open Cam",    self)
+        act_add_roi  = QAction("Add ROI",     self)
+        act_save_cfg = QAction("Save Config", self)
+        act_load_cfg = QAction("Load Config", self)
+        act_quit     = QAction("Quit",        self)
+
+        act_open.triggered.connect(self.open_cam)
+        act_add_roi.triggered.connect(self.enable_draw_roi)
+        act_save_cfg.triggered.connect(self.save_config)
+        act_load_cfg.triggered.connect(self.load_config)
+        act_quit.triggered.connect(self.close)
+
+        tb.addActions([act_open, act_add_roi, act_save_cfg, act_load_cfg, act_quit])
+
+        # ----- Status bar -----
+        self.device_lbl = QLabel("Device: --")
+        self.fps_lbl    = QLabel("FPS: --")
+        self.counts_lbl = QLabel("Counts: -")
+        self.statusBar().addPermanentWidget(self.device_lbl)
+        self.statusBar().addPermanentWidget(self.fps_lbl)
+        self.statusBar().addPermanentWidget(self.counts_lbl)
+
+        # ----- Engine + FPS counter -----
+        self.engine    = None
+        self._fps_last = time.time()
+        self._fps_cnt  = 0
+
+        # Auto-load ROI if exists
+        self.load_config(auto=True)
+
+    # ===== Camera & Engine =====
+    def open_cam(self):
+        url, ok = QInputDialog.getText(self, "RTSP URL", "rtsp:// ...")
+        if not ok or not url:
+            return
+
+        if self.engine and self.engine.isRunning():
+            self.engine.requestInterruption()
+            self.engine.wait()
+
+        rois = [
+            {"name": r["name"], "points": [(p.x(), p.y()) for p in r["points"]]}
+            for r in self.roi_manager
+        ]
+
+        self.engine = TrafficEngine(MODEL_PATH, url, rois, parent=self)
+        self.engine.frame_ready.connect(self.update_view)
+        self.engine.stats_ready.connect(self.update_counts)
+        self.engine.device_info.connect(lambda d: self.device_lbl.setText(f"Device: {d}"))
+        self.engine.error.connect(lambda msg: QMessageBox.critical(self, "Engine Error", msg))
+        self.engine.start()
+
+        # reset FPS
+        self._fps_last = time.time()
+        self._fps_cnt  = 0
+        self.fps_lbl.setText("FPS: --")
+
+    def update_counts(self, stats: dict):
+        if not stats:
+            self.counts_lbl.setText("Counts: -")
+            return
+        self.counts_lbl.setText("Counts: " + " | ".join(f"{k}={v}" for k, v in stats.items()))
+
+    # ===== Display frame =====
+    def update_view(self, frame):
+        h, w = frame.shape[:2]
+        lw, lh = self.video_lbl.width(), self.video_lbl.height()
+
+        # scale (no upscale) + offset
+        scale = min(1.0, min(lw / w, lh / h))
+        disp_w, disp_h = int(w * scale), int(h * scale)
+        off_x = (lw - disp_w) // 2
+        off_y = (lh - disp_h) // 2
+
+        self.video_lbl.set_view_transform(scale, off_x, off_y, w, h)
+
+        qimg = QImage(frame.data, w, h, 3 * w, QImage.Format_BGR888)
+        pix  = QPixmap.fromImage(qimg).scaled(
+            disp_w, disp_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        canvas = QPixmap(lw, lh)
+        canvas.fill(Qt.white)
+        p = QPainter(canvas)
+        p.drawPixmap(off_x, off_y, pix)
+        p.end()
+        self.video_lbl.setPixmap(canvas)
+
+        # update FPS
+        self._fps_cnt += 1
+        now = time.time()
+        if now - self._fps_last >= 1.0:
+            fps = self._fps_cnt / (now - self._fps_last)
+            self.fps_lbl.setText(f"FPS: {fps:.1f}")
+            self._fps_last, self._fps_cnt = now, 0
+
+    # ===== ROI =====
+    def enable_draw_roi(self):
+        self.video_lbl.start_polygon_mode()
+
+    # ===== Save Config =====
+    def save_config(self):
+        if not self.roi_manager:
+            if QMessageBox.question(
+                self, "Save Config",
+                "Danh sách ROI đang rỗng. Ghi đè file và xoá toàn bộ ROI cũ?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            ) != QMessageBox.Yes:
+                return
+
+        data = [
+            {"name": r["name"], "points": [(p.x(), p.y()) for p in r["points"]]}
+            for r in self.roi_manager
+        ]
+        try:
+            with open(CFG_PATH, "w", encoding="utf-8") as f:
+                yaml.safe_dump({"rois": data}, f, allow_unicode=True)
+            QMessageBox.information(self, "Save Config", f"Đã lưu '{CFG_PATH}' thành công.")
+        except Exception as ex:
+            QMessageBox.critical(self, "Save Config", str(ex))
+
+    # ===== Load Config =====
+    def load_config(self, auto=False):
+        if not os.path.exists(CFG_PATH):
+            if not auto:
+                QMessageBox.warning(self, "Load Config", f"Không tìm thấy '{CFG_PATH}'.")
+            return
+        try:
+            with open(CFG_PATH, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            self.roi_manager.clear()
+            self.video_lbl.rois.clear()
+            for item in cfg.get("rois", []):
+                pts = [QPoint(x, y) for x, y in item["points"]]
+                roi = {"name": item["name"], "points": pts}
+                self.roi_manager.append(roi)
+                self.video_lbl.rois.append(roi)
+            self.video_lbl.update()
+            if not auto:
+                QMessageBox.information(self, "Load Config", "Đã nạp ROI thành công.")
+        except Exception as ex:
+            QMessageBox.critical(self, "Load Config", str(ex))
+
+    # ===== Close =====
+    def closeEvent(self, ev):
+        if self.engine and self.engine.isRunning():
+            self.engine.requestInterruption()
+            self.engine.wait()
+        super().closeEvent(ev)
