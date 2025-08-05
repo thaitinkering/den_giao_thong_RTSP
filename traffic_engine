@@ -1,0 +1,156 @@
+# core/traffic_engine.py
+
+from __future__ import annotations
+
+import os
+# ---------- Giảm trễ RTSP qua OpenCV-FFmpeg ----------
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;udp|udpshotsize;9000|"
+    "buffer_size;0|flush_packets;1|"
+    "fflags;nobuffer|flags;low_delay"
+)
+# Nếu muốn dùng TCP thay cho UDP, comment block trên và bật block sau:
+# os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+#     "rtsp_transport;tcp|stimeout;30000000|"
+#     "buffer_size;1048576|max_delay;500000"
+# )
+
+import cv2
+import torch
+import numpy as np
+from PySide6.QtCore import QThread, Signal
+from ultralytics import YOLO
+
+# Nhãn VisDrone
+LABELS = [
+    "pedestrian","people","bicycle","car","van","truck",
+    "tricycle","awning-tricycle","bus","motor"
+]
+VEHICLE_CLASSES = [2,3,4,5,6,7,8,9]
+
+
+def point_in_poly(pt_xy: tuple[int,int], poly_np: np.ndarray) -> bool:
+    """Kiểm tra điểm nằm trong đa giác không."""
+    return cv2.pointPolygonTest(poly_np, pt_xy, False) >= 0
+
+
+class TrafficEngine(QThread):
+    """
+    QThread chạy YOLOv8.track + ByteTrack, vẽ bbox, đếm theo ROI đa giác,
+    và phát tín hiệu về GUI.
+    """
+    frame_ready  = Signal(object)  # ndarray BGR đã vẽ bbox
+    stats_ready  = Signal(dict)    # {"ROI_NAME": count, ...}
+    error        = Signal(str)
+    device_info  = Signal(str)     # "CPU" hoặc "GPU 0: GeForce..."  
+
+    def __init__(
+        self,
+        model_path: str,
+        url: str,
+        rois_image_space: list[dict],
+        device: int|str|None = None,
+        parent=None,
+        imgsz: int = 960,
+        conf: float = 0.25,
+        iou: float = 0.5,
+        vid_stride: int = 2
+    ):
+        super().__init__(parent)
+        self.model_path       = model_path
+        self.url              = url
+        self.rois_info        = rois_image_space or []
+        self.imgsz            = imgsz
+        self.conf             = conf
+        self.iou              = iou
+        self.vid_stride       = vid_stride
+
+        # Xác định device
+        if device is None:
+            self.device = 0 if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+
+        self.vehicle_classes = VEHICLE_CLASSES
+
+    def run(self):
+        try:
+            # Phát thông tin device cho GUI
+            if isinstance(self.device, int):
+                try:
+                    name = torch.cuda.get_device_name(self.device)
+                except:
+                    name = f"CUDA:{self.device}"
+                dev_str = f"GPU:{name}"
+            else:
+                dev_str = "CPU"
+            self.device_info.emit(dev_str)
+
+            # Load model
+            model = YOLO(self.model_path)
+
+            # Chuẩn bị polygon ROI (np.int32)
+            self.roi_polys = [
+                (r["name"], np.array(r["points"], dtype=np.int32))
+                for r in self.rois_info
+            ]
+
+            # Khởi tạo stream
+            stream = model.track(
+                source=self.url,
+                imgsz=self.imgsz,
+                conf=self.conf,
+                iou=self.iou,
+                device=self.device,
+                classes=self.vehicle_classes,
+                tracker="bytetrack.yaml",
+                persist=True,
+                stream=True,
+                verbose=False,
+                vid_stride=self.vid_stride
+            )
+
+            for r in stream:
+                if self.isInterruptionRequested():
+                    break
+
+                frame = r.orig_img  # BGR, full-res
+
+                # Nếu không có detection
+                if not r.boxes or len(r.boxes) == 0:
+                    self.frame_ready.emit(frame)
+                    self.stats_ready.emit({name: 0 for name, _ in self.roi_polys})
+                    continue
+
+                boxes = r.boxes
+                xyxy   = boxes.xyxy.cpu().numpy()
+                clss   = boxes.cls.int().cpu().tolist()
+                confs  = boxes.conf.cpu().tolist() if boxes.conf is not None else [0.0]*len(clss)
+                ids    = boxes.id.int().cpu().tolist() if boxes.id is not None else [None]*len(clss)
+
+                # Đếm unique theo track-id trong từng ROI
+                roi_sets: dict[str,set] = {name: set() for name,_ in self.roi_polys}
+
+                for i, ((x1,y1,x2,y2), c, cf, tid) in enumerate(zip(xyxy,clss,confs,ids)):
+                    x1i, y1i, x2i, y2i = map(int, (x1,y1,x2,y2))
+                    # Vẽ bbox
+                    cv2.rectangle(frame, (x1i,y1i),(x2i,y2i),(0,255,0),2)
+                    lbl = LABELS[c] if 0<=c<len(LABELS) else str(c)
+                    text = f"ID {tid} {lbl} {cf:.2f}" if tid is not None else f"{lbl} {cf:.2f}"
+                    cv2.putText(frame, text, (x1i, y1i-6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0),2)
+
+                    # Chỉ đếm phương tiện
+                    if c not in self.vehicle_classes:
+                        continue
+
+                    cx, cy = int((x1+x2)/2), int((y1+y2)/2)
+                    for roi_name, poly in self.roi_polys:
+                        if point_in_poly((cx,cy), poly):
+                            roi_sets[roi_name].add(int(tid) if tid is not None else (i,cx,cy))
+
+                stats = {name: len(s) for name,s in roi_sets.items()}
+                self.frame_ready.emit(frame)
+                self.stats_ready.emit(stats)
+
+        except Exception as e:
+            self.error.emit(str(e))
